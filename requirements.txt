@@ -1,6 +1,7 @@
-streamlit>=1.51
+streamlit>=1.50
 pandas>=2.2
 numpy>=2.0
 Pillow>=10.0
 openpyxl>=3.1
-google-genai>=1.0
+openai>=1.99
+requests>=2.32
