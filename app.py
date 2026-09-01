@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import os
@@ -5,15 +6,10 @@ from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
+from openai import OpenAI
 from PIL import Image
-
-try:
-    from google import genai
-    from google.genai import types
-except Exception:
-    genai = None
-    types = None
 
 
 # ============================================================
@@ -603,29 +599,112 @@ weekly, pain = build_demo_data()
 risks = risk_table(weekly)
 
 
-def get_gemini_client():
-    key = os.getenv("GEMINI_API_KEY", "").strip()
+def get_xai_key():
+    """Read the xAI/Grok API key from environment variables or Streamlit Secrets."""
+    key = os.getenv("XAI_API_KEY", "").strip()
     if not key:
         try:
-            key = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
+            key = str(st.secrets.get("XAI_API_KEY", "")).strip()
         except Exception:
             key = ""
-    if not key or genai is None:
-        return None
-    try:
-        return genai.Client(api_key=key)
-    except Exception:
-        return None
+    return key
 
 
-def gemini_model():
-    model = os.getenv("GEMINI_MODEL", "").strip()
+def xai_model():
+    """Allow model override without editing app.py."""
+    model = os.getenv("XAI_MODEL", "").strip()
     if not model:
         try:
-            model = str(st.secrets.get("GEMINI_MODEL", "")).strip()
+            model = str(st.secrets.get("XAI_MODEL", "")).strip()
         except Exception:
             model = ""
-    return model or "gemini-2.5-flash"
+    return model or "grok-4.6"
+
+
+@st.cache_resource
+def get_xai_client():
+    """xAI exposes an OpenAI-compatible Responses API."""
+    key = get_xai_key()
+    if not key:
+        return None
+    return OpenAI(
+        api_key=key,
+        base_url="https://api.x.ai/v1",
+        timeout=120.0,
+    )
+
+
+def grok_text(prompt, system_prompt=None):
+    """Send a text-only request to Grok and return plain text."""
+    client = get_xai_client()
+    if client is None:
+        return None
+
+    items = []
+    if system_prompt:
+        items.append({"role": "system", "content": system_prompt})
+    items.append({"role": "user", "content": prompt})
+
+    response = client.responses.create(
+        model=xai_model(),
+        input=items,
+        store=False,
+    )
+    return response.output_text
+
+
+def image_to_data_url(image):
+    """Convert a PIL image into a base64 JPEG data URL for xAI image understanding."""
+    buffer = io.BytesIO()
+    image.convert("RGB").save(buffer, format="JPEG", quality=92)
+    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def grok_image(image, prompt):
+    """Read an image with Grok vision through the Responses API."""
+    client = get_xai_client()
+    if client is None:
+        return None
+
+    response = client.responses.create(
+        model=xai_model(),
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": image_to_data_url(image),
+                        "detail": "high",
+                    },
+                    {
+                        "type": "input_text",
+                        "text": prompt,
+                    },
+                ],
+            }
+        ],
+        store=False,
+    )
+    return response.output_text
+
+
+def xai_transcribe(audio_bytes, filename="nudgeed-question.wav", mime_type="audio/wav"):
+    """Transcribe recorded audio with xAI Speech-to-Text."""
+    key = get_xai_key()
+    if not key:
+        return None
+
+    response = requests.post(
+        "https://api.x.ai/v1/stt",
+        headers={"Authorization": f"Bearer {key}"},
+        files={"file": (filename, audio_bytes, mime_type)},
+        timeout=120,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    return payload.get("text", "").strip()
 
 
 def section(kicker, title, copy=""):
@@ -886,8 +965,7 @@ elif mode == "Student Nudge":
     section("NUDGEED COPILOT", "Ask for a practical next step", "Recovery, deadlines, study planning or campus support.")
     question = st.text_input("Ask NudgeEd", placeholder="How do I recover my attendance and DBMS score this week?", label_visibility="collapsed")
     if st.button("Get my 7-day plan", type="primary", disabled=not bool(question.strip())):
-        client = get_gemini_client()
-        if client:
+        if get_xai_client():
             context = {
                 "attendance": r["latest_attendance"],
                 "attendance_trend_per_week": round(r["attendance_slope"], 2),
@@ -896,14 +974,27 @@ elif mode == "Student Nudge":
                 "missed_assignments": r["missed"],
                 "risk_level": r["risk_level"],
             }
-            prompt = f"You are NudgeEd, a concise campus student-support assistant. Never shame or diagnose. Student context: {json.dumps(context)}. Question: {question}. Reply with a short prioritized plan for the next 7 days."
+            prompt = (
+                f"Student context: {json.dumps(context)}\n"
+                f"Student question: {question}\n\n"
+                "Create a short, prioritized 7-day recovery plan. Keep it practical, "
+                "specific and supportive. Do not shame, diagnose, or present the risk score "
+                "as a final prediction."
+            )
             try:
-                response = client.models.generate_content(model=gemini_model(), contents=prompt)
-                st.write(response.text)
+                answer = grok_text(
+                    prompt,
+                    system_prompt=(
+                        "You are NudgeEd, a concise campus student-support assistant. "
+                        "Focus on attendance recovery, study planning, deadlines and appropriate "
+                        "campus support. Never invent college-specific rules or facts."
+                    ),
+                )
+                st.markdown(answer or "No response returned by Grok.")
             except Exception as e:
-                st.error(f"AI service error: {e}")
+                st.error(f"Grok service error: {e}")
         else:
-            st.info("Prototype guidance: protect the next three classes, clear one missed task today, and schedule two 25-minute revision blocks. Add GEMINI_API_KEY for live AI guidance.")
+            st.info("Prototype guidance: protect the next three classes, clear one missed task today, and schedule two 25-minute revision blocks. Add XAI_API_KEY for live Grok guidance.")
 
 
 # ============================================================
@@ -966,12 +1057,17 @@ elif mode == "NudgeEd Lens":
         image = Image.open(image_file).convert("RGB")
         st.image(image, caption="Captured notice", use_container_width=True)
         if st.button("Extract relevant deadlines", type="primary"):
-            client = get_gemini_client()
-            if client:
-                prompt = f"Read this campus noticeboard image. Extract only items relevant to course {course}, year {year}. Return concise markdown with title, date/deadline, required action, and location/link if visible. Never invent unclear dates."
+            if get_xai_client():
+                prompt = (
+                    f"Read this campus noticeboard image. The student is in course {course}, year {year}. "
+                    "Extract ONLY notices that are clearly relevant to that course/year. "
+                    "Return concise markdown. For each relevant item include: title, date/deadline, "
+                    "required action, and location/link if visibly present. If text is unclear, say "
+                    "'unclear in image' instead of inventing information."
+                )
                 try:
-                    response = client.models.generate_content(model=gemini_model(), contents=[prompt, image])
-                    st.markdown(response.text)
+                    answer = grok_image(image, prompt)
+                    st.markdown(answer or "No relevant notice text was returned.")
                 except Exception as e:
                     st.error(f"Lens error: {e}")
             else:
@@ -980,7 +1076,7 @@ elif mode == "NudgeEd Lens":
                     {"Deadline": (date.today()+timedelta(days=7)).isoformat(), "Notice": "Mid-Sem Remedial Registration", "Action": "Register via department office", "Relevant to": f"{course} Year {year}"},
                 ])
                 st.dataframe(demo, hide_index=True, use_container_width=True)
-                st.caption("Camera capture is live. Add GEMINI_API_KEY for real notice understanding.")
+                st.caption("Camera capture is live. Add XAI_API_KEY for real Grok notice understanding.")
     else:
         st.info("Capture or upload a noticeboard image to test the Lens flow.")
 
@@ -1005,17 +1101,38 @@ elif mode == "Voice Assistant":
     if audio:
         st.audio(audio)
         if st.button("Understand & answer", type="primary"):
-            client = get_gemini_client()
-            if client and types is not None:
+            if get_xai_key():
                 try:
-                    audio_part = types.Part.from_bytes(data=audio.getvalue(), mime_type="audio/wav")
-                    prompt = "Transcribe this student's question, then answer concisely as a campus support assistant. First line: 'You asked: ...'. Do not invent campus-specific facts."
-                    response = client.models.generate_content(model=gemini_model(), contents=[audio_part, prompt])
-                    st.write(response.text)
+                    transcript = xai_transcribe(
+                        audio.getvalue(),
+                        filename="nudgeed-question.wav",
+                        mime_type="audio/wav",
+                    )
+                    if not transcript:
+                        st.warning("I couldn't detect speech in that recording. Try again a little closer to the microphone.")
+                    else:
+                        st.markdown(f"**You asked:** {transcript}")
+                        answer = grok_text(
+                            transcript,
+                            system_prompt=(
+                                "You are NudgeEd, a concise campus support assistant. "
+                                "Answer the student's spoken question with practical next steps. "
+                                "Do not invent college-specific dates, policies, people or locations. "
+                                "If such information is required, say the student should verify it with the college."
+                            ),
+                        )
+                        st.markdown(answer or "No response returned by Grok.")
+                except requests.HTTPError as e:
+                    detail = ""
+                    try:
+                        detail = e.response.text
+                    except Exception:
+                        pass
+                    st.error(f"xAI speech-to-text error: {detail or e}")
                 except Exception as e:
                     st.error(f"Voice assistant error: {e}")
             else:
-                st.info("Microphone capture works. Add GEMINI_API_KEY to enable speech understanding and AI responses.")
+                st.info("Microphone capture works. Add XAI_API_KEY to enable xAI speech-to-text and Grok responses.")
 
 
 # ============================================================
