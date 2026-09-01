@@ -8,7 +8,14 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-from openai import OpenAI
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+    import streamlit as st
+    st.error("OpenAI package not installed. Please install it using: pip install openai")
+
 from PIL import Image
 
 
