@@ -625,7 +625,7 @@ def gemini_model():
             model = str(st.secrets.get("GEMINI_MODEL", "")).strip()
         except Exception:
             model = ""
-    return model or "gemini-2.5-flash"
+    return model or "gemini-3.7-flash"
 
 
 def section(kicker, title, copy=""):
